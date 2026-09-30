@@ -74,13 +74,19 @@ api_key = os.getenv("OPENROUTER_API_KEY")
 if not api_key:
     raise RuntimeError("OPENROUTER_API_KEY environment variable is missing!")
 
+# OpenRouter requires default headers to avoid 403 / 500 errors
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=api_key,
+    default_headers={
+        "HTTP-Referer": "https://render.com",
+        "X-Title": "Adaptive Coding Assistant"
+    }
 )
 
-# You can use free models on OpenRouter like qwen/qwen-2.5-coder-32b-instruct:free
-MODEL_NAME = "qwen/qwen-2.5-coder-32b-instruct:free"
+# Reliable free models on OpenRouter:
+# "meta-llama/llama-3.3-70b-instruct:free" or "google/gemini-2.5-flash:free"
+MODEL_NAME = "meta-llama/llama-3.3-70b-instruct:free"
 
 class QueryRequest(BaseModel):
     prompt: str
@@ -105,6 +111,7 @@ def serve_ui():
             .msg { padding: 0.8rem; margin: 0.5rem 0; border-radius: 6px; white-space: pre-wrap; }
             .user { background: #1e3a8a; }
             .assistant { background: #064e3b; }
+            .error { color: #f87171; font-weight: bold; }
         </style>
     </head>
     <body>
@@ -156,19 +163,27 @@ def serve_ui():
                     body: JSON.stringify({ instruction_change: change })
                 });
                 const data = await res.json();
-                document.getElementById('currentInstruction').innerText = data.new_system_instruction;
-                document.getElementById('configInput').value = '';
+                if (res.ok) {
+                    document.getElementById('currentInstruction').innerText = data.new_system_instruction;
+                    document.getElementById('configInput').value = '';
+                } else {
+                    document.getElementById('currentInstruction').innerHTML = `<span class="error">Error: ${data.detail}</span>`;
+                }
             }
 
             async function sendPrompt() {
                 const prompt = document.getElementById('promptInput').value;
                 if (!prompt) return;
                 document.getElementById('promptInput').value = '';
-                await fetch('/ask', {
+                const res = await fetch('/ask', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ prompt: prompt })
                 });
+                const data = await res.json();
+                if (!res.ok) {
+                    alert("Error: " + data.detail);
+                }
                 fetchHistory();
             }
 
@@ -206,6 +221,7 @@ def update_behavior(request: BehaviorRequest):
         set_system_instruction(new_instruction)
         return {"new_system_instruction": new_instruction}
     except Exception as e:
+        print(f"Config Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/history")
@@ -229,10 +245,11 @@ def delete_history():
 @app.post("/ask")
 def ask_code(request: QueryRequest):
     current_instruction = get_system_instruction()
-    save_chat_message("user", request.prompt)
     
+    # Format message history before saving new user message
     messages = [{"role": "system", "content": current_instruction}]
     messages.extend(get_chat_history())
+    messages.append({"role": "user", "content": request.prompt})
     
     try:
         response = client.chat.completions.create(
@@ -240,7 +257,11 @@ def ask_code(request: QueryRequest):
             messages=messages
         )
         ai_reply = response.choices[0].message.content
+        
+        # Save both messages to history after successful API call
+        save_chat_message("user", request.prompt)
         save_chat_message("assistant", ai_reply)
         return {"response": ai_reply}
     except Exception as e:
+        print(f"Ask Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
