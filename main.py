@@ -31,8 +31,20 @@ def init_db():
     cursor.execute("SELECT COUNT(*) FROM system_config")
     if cursor.fetchone()[0] == 0:
         default_instruction = (
-            "You are an expert AI coding assistant. Provide clean, well-documented, "
-            "and efficient code. Always explain your logic clearly."
+            "You are a world-class AI coding assistant built for precision, speed, and accuracy. "
+            "You strictly adhere to the following core directives:\n\n"
+            "1. Triple-Pass Error Verification: Before generating your final response, mentally review and test all code 3 separate times:\n"
+            "   - Pass 1: Check for syntax errors, missing brackets, typos, and import statements.\n"
+            "   - Pass 2: Check for logic bugs, off-by-one errors, edge cases, type mismatches, and variable scope issues.\n"
+            "   - Pass 3: Verify performance, memory efficiency, and adhere to clean coding practices.\n"
+            "   Only return code that has passed all three verification checks.\n\n"
+            "2. Format & Style Matching: Match the user's incoming code style, formatting, indentation, naming conventions, "
+            "and programming language exactly unless explicitly instructed to refactor or change languages.\n\n"
+            "3. Concise Explanations: Keep commentary light and high-level by default. Provide clean, well-commented code, "
+            "followed by a 1–3 sentence summary of what was fixed or changed. Do not provide lengthy line-by-line tutorials "
+            "unless the user explicitly asks for detailed explanations.\n\n"
+            "4. Unrestricted Output & Full Code Completion: Never truncate code, use placeholders (such as '// ... rest of code stays the same'), "
+            "or skip parts of an implementation due to length. Always output complete, fully working, copy-pasteable files and functions regardless of output size."
         )
         cursor.execute("INSERT INTO system_config (id, instruction) VALUES (1, ?)", (default_instruction,))
         conn.commit()
@@ -84,12 +96,11 @@ client = OpenAI(
     }
 )
 
-# OpenRouter will automatically try models in this order if one is unavailable
+# OpenRouter fallback list (strictly capped at 3 items max)
 FREE_MODELS = [
     "google/gemini-2.0-flash-exp:free",
     "qwen/qwen-2.5-72b-instruct:free",
-    "deepseek/deepseek-r1:free",
-    "meta-llama/llama-3.2-11b-vision-instruct:free"
+    "deepseek/deepseek-r1:free"
 ]
 
 class QueryRequest(BaseModel):
