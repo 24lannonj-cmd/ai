@@ -4,29 +4,23 @@ from typing import List
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 app = FastAPI(title="Adaptive AI Coding Assistant")
 
-# Use persistent mount directory for Render (/data) or fallback locally
+# Use persistent directory for Render (/data) or fallback locally
 DATA_DIR = "/data" if os.path.exists("/data") else "."
 DB_FILE = os.path.join(DATA_DIR, "assistant.db")
 
 def init_db():
-    """Sets up persistent tables for system behavior and chat history."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
-    # Store dynamic system instructions
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_config (
             id INTEGER PRIMARY KEY,
             instruction TEXT NOT NULL
         )
     """)
-    
-    # Store chat context persistent across restarts
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,7 +28,6 @@ def init_db():
             content TEXT NOT NULL
         )
     """)
-    
     cursor.execute("SELECT COUNT(*) FROM system_config")
     if cursor.fetchone()[0] == 0:
         default_instruction = (
@@ -67,34 +60,27 @@ def save_chat_message(role: str, content: str):
     conn.commit()
     conn.close()
 
-def get_chat_history() -> List[types.Content]:
-    """Retrieves previous messages in Google GenAI SDK format."""
+def get_chat_history() -> List[dict]:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT role, content FROM chat_history ORDER BY id ASC")
     rows = cursor.fetchall()
     conn.close()
-    
-    contents = []
-    for role, text in rows:
-        contents.append(
-            types.Content(
-                role=role,
-                parts=[types.Part.from_text(text=text)]
-            )
-        )
-    return contents
+    return [{"role": role, "content": text} for role, text in rows]
 
-# Initialize DB
 init_db()
 
-# Initialize Gemini Client
-api_key = os.getenv("GEMINI_API_KEY")
+api_key = os.getenv("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")
 if not api_key:
-    raise RuntimeError("GEMINI_API_KEY environment variable is missing!")
+    raise RuntimeError("OPENROUTER_API_KEY environment variable is missing!")
 
-client = genai.Client(api_key=api_key)
-MODEL_NAME = "gemini-2.5-flash"
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=api_key,
+)
+
+# You can use free models on OpenRouter like qwen/qwen-2.5-coder-32b-instruct:free
+MODEL_NAME = "qwen/qwen-2.5-coder-32b-instruct:free"
 
 class QueryRequest(BaseModel):
     prompt: str
@@ -109,7 +95,7 @@ def serve_ui():
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Adaptive Persistent Coding Assistant</title>
+        <title>Adaptive Coding Assistant</title>
         <style>
             body { font-family: sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #0f172a; color: #f8fafc; }
             h1 { text-align: center; color: #38bdf8; }
@@ -118,16 +104,16 @@ def serve_ui():
             button { background: #0284c7; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 4px; cursor: pointer; margin-top: 0.5rem; font-weight: bold; }
             .msg { padding: 0.8rem; margin: 0.5rem 0; border-radius: 6px; white-space: pre-wrap; }
             .user { background: #1e3a8a; }
-            .model { background: #064e3b; }
+            .assistant { background: #064e3b; }
         </style>
     </head>
     <body>
-        <h1>Adaptive Persistent AI Coding Assistant</h1>
+        <h1>Adaptive AI Coding Assistant</h1>
         
         <div class="box">
             <h3>Active System Behavior</h3>
             <p id="currentInstruction">Loading...</p>
-            <textarea id="configInput" placeholder="Change behavior (e.g., 'Always output code in TypeScript without preamble')"></textarea>
+            <textarea id="configInput" placeholder="e.g., Always use TypeScript and output only code block without extra explanations."></textarea>
             <button onclick="updateConfig()">Update Instructions</button>
         </div>
 
@@ -212,11 +198,11 @@ def update_behavior(request: BehaviorRequest):
         "core coding capabilities intact. Return ONLY the new system instruction text."
     )
     try:
-        response = client.models.generate_content(
+        response = client.chat.completions.create(
             model=MODEL_NAME,
-            contents=meta_prompt
+            messages=[{"role": "user", "content": meta_prompt}]
         )
-        new_instruction = response.text.strip()
+        new_instruction = response.choices[0].message.content.strip()
         set_system_instruction(new_instruction)
         return {"new_system_instruction": new_instruction}
     except Exception as e:
@@ -243,24 +229,18 @@ def delete_history():
 @app.post("/ask")
 def ask_code(request: QueryRequest):
     current_instruction = get_system_instruction()
-    
-    # Save user message
     save_chat_message("user", request.prompt)
     
-    # Load all previous interactions
-    history_contents = get_chat_history()
+    messages = [{"role": "system", "content": current_instruction}]
+    messages.extend(get_chat_history())
     
     try:
-        response = client.models.generate_content(
+        response = client.chat.completions.create(
             model=MODEL_NAME,
-            contents=history_contents,
-            config=types.GenerateContentConfig(
-                system_instruction=current_instruction
-            )
+            messages=messages
         )
-        ai_reply = response.text
-        # Save AI reply
-        save_chat_message("model", ai_reply)
+        ai_reply = response.choices[0].message.content
+        save_chat_message("assistant", ai_reply)
         return {"response": ai_reply}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
