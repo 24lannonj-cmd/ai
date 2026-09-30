@@ -74,7 +74,7 @@ api_key = os.getenv("OPENROUTER_API_KEY")
 if not api_key:
     raise RuntimeError("OPENROUTER_API_KEY environment variable is missing!")
 
-# OpenRouter requires default headers to avoid 403 / 500 errors
+# OpenRouter client initialization with required headers
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=api_key,
@@ -84,9 +84,13 @@ client = OpenAI(
     }
 )
 
-# Reliable free models on OpenRouter:
-# "meta-llama/llama-3.3-70b-instruct:free" or "google/gemini-2.5-flash:free"
-MODEL_NAME = "meta-llama/llama-3.3-70b-instruct:free"
+# OpenRouter will automatically try models in this order if one is unavailable
+FREE_MODELS = [
+    "google/gemini-2.0-flash-exp:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+    "deepseek/deepseek-r1:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free"
+]
 
 class QueryRequest(BaseModel):
     prompt: str
@@ -214,8 +218,9 @@ def update_behavior(request: BehaviorRequest):
     )
     try:
         response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": meta_prompt}]
+            model=FREE_MODELS[0],
+            messages=[{"role": "user", "content": meta_prompt}],
+            extra_body={"models": FREE_MODELS}
         )
         new_instruction = response.choices[0].message.content.strip()
         set_system_instruction(new_instruction)
@@ -246,19 +251,18 @@ def delete_history():
 def ask_code(request: QueryRequest):
     current_instruction = get_system_instruction()
     
-    # Format message history before saving new user message
     messages = [{"role": "system", "content": current_instruction}]
     messages.extend(get_chat_history())
     messages.append({"role": "user", "content": request.prompt})
     
     try:
         response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages
+            model=FREE_MODELS[0],
+            messages=messages,
+            extra_body={"models": FREE_MODELS}
         )
         ai_reply = response.choices[0].message.content
         
-        # Save both messages to history after successful API call
         save_chat_message("user", request.prompt)
         save_chat_message("assistant", ai_reply)
         return {"response": ai_reply}
