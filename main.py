@@ -70,7 +70,7 @@ def get_chat_history() -> List[dict]:
 
 init_db()
 
-api_key = os.getenv("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")
+api_key = os.getenv("OPENROUTER_API_KEY")
 if not api_key:
     raise RuntimeError("OPENROUTER_API_KEY environment variable is missing!")
 
