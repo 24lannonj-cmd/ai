@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from typing import List
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -8,18 +9,32 @@ from google.genai import types
 
 app = FastAPI(title="Adaptive AI Coding Assistant")
 
-# Database setup for persistent behavior storage
-DB_FILE = "assistant.db"
+# Use persistent mount directory for Render (/data) or fallback locally
+DATA_DIR = "/data" if os.path.exists("/data") else "."
+DB_FILE = os.path.join(DATA_DIR, "assistant.db")
 
 def init_db():
+    """Sets up persistent tables for system behavior and chat history."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    
+    # Store dynamic system instructions
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_config (
             id INTEGER PRIMARY KEY,
             instruction TEXT NOT NULL
         )
     """)
+    
+    # Store chat context persistent across restarts
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL
+        )
+    """)
+    
     cursor.execute("SELECT COUNT(*) FROM system_config")
     if cursor.fetchone()[0] == 0:
         default_instruction = (
@@ -45,7 +60,32 @@ def set_system_instruction(new_instruction: str):
     conn.commit()
     conn.close()
 
-# Initialize DB on startup
+def save_chat_message(role: str, content: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO chat_history (role, content) VALUES (?, ?)", (role, content))
+    conn.commit()
+    conn.close()
+
+def get_chat_history() -> List[types.Content]:
+    """Retrieves previous messages in Google GenAI SDK format."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role, content FROM chat_history ORDER BY id ASC")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    contents = []
+    for role, text in rows:
+        contents.append(
+            types.Content(
+                role=role,
+                parts=[types.Part.from_text(text=text)]
+            )
+        )
+    return contents
+
+# Initialize DB
 init_db()
 
 # Initialize Gemini Client
@@ -62,44 +102,42 @@ class QueryRequest(BaseModel):
 class BehaviorRequest(BaseModel):
     instruction_change: str
 
-
 @app.get("/", response_class=HTMLResponse)
 def serve_ui():
-    """Serves a lightweight Web GUI."""
     return """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Adaptive Coding Assistant</title>
+        <title>Adaptive Persistent Coding Assistant</title>
         <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #0f172a; color: #f8fafc; }
+            body { font-family: sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #0f172a; color: #f8fafc; }
             h1 { text-align: center; color: #38bdf8; }
             .box { background: #1e293b; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; border: 1px solid #334155; }
-            textarea { width: 100%; height: 80px; background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: 4px; padding: 0.5rem; box-sizing: border-box; }
+            textarea { width: 100%; height: 70px; background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: 4px; padding: 0.5rem; box-sizing: border-box; }
             button { background: #0284c7; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 4px; cursor: pointer; margin-top: 0.5rem; font-weight: bold; }
-            button:hover { background: #0369a1; }
-            pre { background: #0f172a; padding: 1rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; color: #cbd5e1; }
-            .badge { background: #334155; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; color: #38bdf8; }
+            .msg { padding: 0.8rem; margin: 0.5rem 0; border-radius: 6px; white-space: pre-wrap; }
+            .user { background: #1e3a8a; }
+            .model { background: #064e3b; }
         </style>
     </head>
     <body>
-        <h1>Adaptive AI Coding Assistant</h1>
+        <h1>Adaptive Persistent AI Coding Assistant</h1>
         
         <div class="box">
             <h3>Active System Behavior</h3>
-            <p id="currentInstruction">Loading current instructions...</p>
-            <h4>Modify Behavior</h4>
-            <textarea id="configInput" placeholder="e.g., Always use TypeScript and output only code block without extra explanations."></textarea>
+            <p id="currentInstruction">Loading...</p>
+            <textarea id="configInput" placeholder="Change behavior (e.g., 'Always output code in TypeScript without preamble')"></textarea>
             <button onclick="updateConfig()">Update Instructions</button>
         </div>
 
         <div class="box">
-            <h3>Ask Code Question</h3>
-            <textarea id="promptInput" placeholder="e.g., Write an Express.js server route for user authentication."></textarea>
-            <button onclick="sendPrompt()">Submit Task</button>
-            <h4>Response:</h4>
-            <pre id="output">Output will appear here...</pre>
+            <h3>Persistent Chat Session</h3>
+            <div id="chatHistory"></div>
+            <hr style="border-color:#334155; margin: 1rem 0;">
+            <textarea id="promptInput" placeholder="Ask a question or request code..."></textarea>
+            <button onclick="sendPrompt()">Send</button>
+            <button onclick="clearChat()" style="background:#dc2626; float:right;">Clear History</button>
         </div>
 
         <script>
@@ -109,10 +147,23 @@ def serve_ui():
                 document.getElementById('currentInstruction').innerText = data.current_instruction;
             }
 
+            async function fetchHistory() {
+                const res = await fetch('/history');
+                const data = await res.json();
+                const container = document.getElementById('chatHistory');
+                container.innerHTML = '';
+                data.history.forEach(msg => {
+                    const div = document.createElement('div');
+                    div.className = 'msg ' + msg.role;
+                    div.innerText = (msg.role === 'user' ? 'You: ' : 'AI: ') + msg.content;
+                    container.appendChild(div);
+                });
+            }
+
             async function updateConfig() {
                 const change = document.getElementById('configInput').value;
                 if (!change) return;
-                document.getElementById('currentInstruction').innerText = "Updating rules...";
+                document.getElementById('currentInstruction').innerText = "Updating...";
                 const res = await fetch('/config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -126,17 +177,22 @@ def serve_ui():
             async function sendPrompt() {
                 const prompt = document.getElementById('promptInput').value;
                 if (!prompt) return;
-                document.getElementById('output').innerText = "Generating code...";
-                const res = await fetch('/ask', {
+                document.getElementById('promptInput').value = '';
+                await fetch('/ask', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ prompt: prompt })
                 });
-                const data = await res.json();
-                document.getElementById('output').innerText = data.response || data.detail;
+                fetchHistory();
+            }
+
+            async function clearChat() {
+                await fetch('/history', { method: 'DELETE' });
+                fetchHistory();
             }
 
             fetchConfig();
+            fetchHistory();
         </script>
     </body>
     </html>
@@ -155,7 +211,6 @@ def update_behavior(request: BehaviorRequest):
         "Rewrite the system instructions to incorporate this change while keeping "
         "core coding capabilities intact. Return ONLY the new system instruction text."
     )
-    
     try:
         response = client.models.generate_content(
             model=MODEL_NAME,
@@ -163,24 +218,49 @@ def update_behavior(request: BehaviorRequest):
         )
         new_instruction = response.text.strip()
         set_system_instruction(new_instruction)
-        return {
-            "message": "System prompt updated successfully",
-            "new_system_instruction": new_instruction
-        }
+        return {"new_system_instruction": new_instruction}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/history")
+def read_history():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role, content FROM chat_history ORDER BY id ASC")
+    rows = cursor.fetchall()
+    conn.close()
+    return {"history": [{"role": r, "content": c} for r, c in rows]}
+
+@app.delete("/history")
+def delete_history():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM chat_history")
+    conn.commit()
+    conn.close()
+    return {"status": "cleared"}
 
 @app.post("/ask")
 def ask_code(request: QueryRequest):
     current_instruction = get_system_instruction()
+    
+    # Save user message
+    save_chat_message("user", request.prompt)
+    
+    # Load all previous interactions
+    history_contents = get_chat_history()
+    
     try:
         response = client.models.generate_content(
             model=MODEL_NAME,
-            contents=request.prompt,
+            contents=history_contents,
             config=types.GenerateContentConfig(
                 system_instruction=current_instruction
             )
         )
-        return {"response": response.text}
+        ai_reply = response.text
+        # Save AI reply
+        save_chat_message("model", ai_reply)
+        return {"response": ai_reply}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
