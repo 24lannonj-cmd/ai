@@ -96,11 +96,12 @@ client = OpenAI(
     }
 )
 
-# Active free fallback array (strictly max 3 items to prevent 400 errors)
+# OpenRouter fallback list (openrouter/free dynamically routes to whatever $0/token model is available)
+# Capped at strictly 3 items to avoid 400 errors from OpenRouter
 FREE_MODELS = [
-    "qwen/qwen-2.5-72b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
-    "deepseek/deepseek-r1:free"
+    "openrouter/free",
+    "qwen/qwen3.8-27b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free"
 ]
 
 class QueryRequest(BaseModel):
