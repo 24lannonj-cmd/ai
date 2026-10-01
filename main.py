@@ -7,103 +7,172 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from openai import AsyncOpenAI
+import aiosqlite
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+from functools import lru_cache
+import hashlib
 
-app = FastAPI(title="Adaptive AI Coding Assistant")
+app = FastAPI(title="Adaptive AI Coding Assistant - Optimized")
 
 DATA_DIR = "/data" if os.path.exists("/data") else "."
 DB_FILE = os.path.join(DATA_DIR, "assistant.db")
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS system_config (
-            id INTEGER PRIMARY KEY,
-            instruction TEXT NOT NULL
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT DEFAULT 'default',
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_history(session_id, id)")
+# Connection pool for SQLite
+db_lock = threading.Lock()
+db_connections = []
+max_connections = 10
+
+def get_db_connection():
+    with db_lock:
+        if db_connections:
+            return db_connections.pop()
+        else:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=10000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            return conn
+
+def return_db_connection(conn):
+    with db_lock:
+        if len(db_connections) < max_connections:
+            db_connections.append(conn)
+        else:
+            conn.close()
+
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS system_config (
+                id INTEGER PRIMARY KEY,
+                instruction TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT DEFAULT 'default',
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_history(session_id, id)")
+        
+        cursor = await conn.execute("SELECT COUNT(*) FROM system_config")
+        if (await cursor.fetchone())[0] == 0:
+            default_instruction = (
+                "You are a world-class AI coding assistant built for precision, speed, and accuracy. "
+                "You strictly adhere to the following core directives:\n\n"
+                "1. Triple-Pass Error Verification: Before generating your final response, mentally review and test all code 3 separate times:\n"
+                "   - Pass 1: Check for syntax errors, missing brackets, typos, and import statements.\n"
+                "   - Pass 2: Check for logic bugs, off-by-one errors, edge cases, type mismatches, and variable scope issues.\n"
+                "   - Pass 3: Verify performance, memory efficiency, and adhere to clean coding practices.\n"
+                "   Only return code that has passed all three verification checks.\n\n"
+                "2. Format & Style Matching: Match the user's incoming code style, formatting, indentation, naming conventions, "
+                "and programming language exactly unless explicitly instructed to refactor or change languages.\n\n"
+                "3. Concise Explanations: Keep commentary light and high-level by default. Provide clean, well-commented code, "
+                "followed by a 1–3 sentence summary of what was fixed or changed. Do not provide lengthy line-by-line tutorials "
+                "unless the user explicitly asks for detailed explanations.\n\n"
+                "4. Unrestricted Output & Full Code Completion: Never truncate code, use placeholders (such as '// ... rest of code stays the same'), "
+                "or skip parts of an implementation due to length. Always output complete, fully working, copy-pasteable files and functions regardless of output size."
+            )
+            await conn.execute("INSERT INTO system_config (id, instruction) VALUES (1, ?)", (default_instruction,))
+        await conn.commit()
+
+# Cached system instruction with TTL
+_system_instruction_cache = {"value": None, "timestamp": 0}
+CACHE_TTL = 300  # 5 minutes
+
+async def get_system_instruction() -> str:
+    current_time = time.time()
+    if _system_instruction_cache["value"] and (current_time - _system_instruction_cache["timestamp"]) < CACHE_TTL:
+        return _system_instruction_cache["value"]
     
-    cursor.execute("SELECT COUNT(*) FROM system_config")
-    if cursor.fetchone()[0] == 0:
-        default_instruction = (
-            "You are a world-class AI coding assistant built for precision, speed, and accuracy. "
-            "You strictly adhere to the following core directives:\n\n"
-            "1. Triple-Pass Error Verification: Before generating your final response, mentally review and test all code 3 separate times:\n"
-            "   - Pass 1: Check for syntax errors, missing brackets, typos, and import statements.\n"
-            "   - Pass 2: Check for logic bugs, off-by-one errors, edge cases, type mismatches, and variable scope issues.\n"
-            "   - Pass 3: Verify performance, memory efficiency, and adhere to clean coding practices.\n"
-            "   Only return code that has passed all three verification checks.\n\n"
-            "2. Format & Style Matching: Match the user's incoming code style, formatting, indentation, naming conventions, "
-            "and programming language exactly unless explicitly instructed to refactor or change languages.\n\n"
-            "3. Concise Explanations: Keep commentary light and high-level by default. Provide clean, well-commented code, "
-            "followed by a 1–3 sentence summary of what was fixed or changed. Do not provide lengthy line-by-line tutorials "
-            "unless the user explicitly asks for detailed explanations.\n\n"
-            "4. Unrestricted Output & Full Code Completion: Never truncate code, use placeholders (such as '// ... rest of code stays the same'), "
-            "or skip parts of an implementation due to length. Always output complete, fully working, copy-pasteable files and functions regardless of output size."
+    async with aiosqlite.connect(DB_FILE) as conn:
+        cursor = await conn.execute("SELECT instruction FROM system_config WHERE id = 1")
+        result = (await cursor.fetchone())[0]
+        _system_instruction_cache.update({"value": result, "timestamp": current_time})
+        return result
+
+async def set_system_instruction(new_instruction: str):
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("UPDATE system_config SET instruction = ? WHERE id = 1", (new_instruction,))
+        await conn.commit()
+        _system_instruction_cache.update({"value": new_instruction, "timestamp": time.time()})
+
+# Batch chat history saving
+chat_history_buffer = []
+buffer_lock = threading.Lock()
+
+async def save_chat_message_batch():
+    if not chat_history_buffer:
+        return
+    
+    with buffer_lock:
+        messages_to_save = chat_history_buffer.copy()
+        chat_history_buffer.clear()
+    
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.executemany(
+            "INSERT INTO chat_history (session_id, role, content) VALUES (?, ?, ?)",
+            [(msg["session_id"], msg["role"], msg["content"]) for msg in messages_to_save]
         )
-        cursor.execute("INSERT INTO system_config (id, instruction) VALUES (1, ?)", (default_instruction,))
-        conn.commit()
-    conn.close()
-
-def get_system_instruction() -> str:
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT instruction FROM system_config WHERE id = 1")
-    result = cursor.fetchone()[0]
-    conn.close()
-    return result
-
-def set_system_instruction(new_instruction: str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE system_config SET instruction = ? WHERE id = 1", (new_instruction,))
-    conn.commit()
-    conn.close()
+        await conn.commit()
 
 def save_chat_message(role: str, content: str, session_id: str = "default"):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO chat_history (session_id, role, content) VALUES (?, ?, ?)", (session_id, role, content))
-    conn.commit()
-    conn.close()
+    with buffer_lock:
+        chat_history_buffer.append({
+            "session_id": session_id,
+            "role": role,
+            "content": content
+        })
 
-def get_recent_chat_history(session_id: str = "default", limit: int = 10) -> List[dict]:
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT role, content FROM (SELECT id, role, content FROM chat_history WHERE session_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
-        (session_id, limit)
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"role": role, "content": text} for role, text in rows]
+async def get_recent_chat_history(session_id: str = "default", limit: int = 10) -> List[dict]:
+    async with aiosqlite.connect(DB_FILE) as conn:
+        cursor = await conn.execute(
+            "SELECT role, content FROM (SELECT id, role, content FROM chat_history WHERE session_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
+            (session_id, limit)
+        )
+        rows = await cursor.fetchall()
+        return [{"role": role, "content": text} for role, text in rows]
 
-init_db()
+# Background task for periodic buffer flushing
+async def flush_chat_buffer_periodically():
+    while True:
+        await asyncio.sleep(5)  # Flush every 5 seconds
+        await save_chat_message_batch()
+
+# Initialize database and start background tasks
+async def startup_event():
+    await init_db()
+    asyncio.create_task(flush_chat_buffer_periodically())
+
+app.add_event_handler("startup", startup_event)
 
 api_key = os.getenv("OPENROUTER_API_KEY")
 if not api_key:
     raise RuntimeError("OPENROUTER_API_KEY environment variable is missing!")
 
-# Non-blocking AsyncOpenAI client
+# Optimized client with connection pooling
 client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=api_key,
     default_headers={
         "HTTP-Referer": "https://render.com",
         "X-Title": "Adaptive Coding Assistant"
-    }
+    },
+    timeout=30.0,  # Add timeout
+    max_retries=2
 )
 
+# Parallel model execution for faster responses
 FREE_MODELS = [
     "openrouter/free",
     "google/gemini-2.0-flash-exp:free",
@@ -125,8 +194,7 @@ def serve_ui():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Adaptive AI Coding Studio</title>
-        <!-- Markdown & Code Syntax Highlighting -->
+        <title>Adaptive AI Coding Studio - Optimized</title>
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/tokyo-night-dark.min.css">
         <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -154,10 +222,15 @@ def serve_ui():
             code { font-family: "Fira Code", Consolas, Monaco, monospace; font-size: 0.9rem; }
             .copy-btn { position: absolute; top: 8px; right: 8px; background: #334155; color: #fff; border: none; padding: 4px 8px; font-size: 0.75rem; border-radius: 4px; cursor: pointer; }
             .error { color: #f87171; font-weight: bold; }
+            .typing-indicator { display: inline-block; }
+            .typing-indicator span { height: 8px; width: 8px; background: #38bdf8; border-radius: 50%; display: inline-block; margin: 0 1px; animation: typing 1.4s infinite ease-in-out; }
+            .typing-indicator span:nth-child(1) { animation-delay: -0.32s; }
+            .typing-indicator span:nth-child(2) { animation-delay: -0.16s; }
+            @keyframes typing { 0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; } 40% { transform: scale(1); opacity: 1; } }
         </style>
     </head>
     <body>
-        <h1>Adaptive AI Coding Studio</h1>
+        <h1>Adaptive AI Coding Studio ⚡</h1>
         
         <div class="box">
             <h3>Active System Persona & Rules</h3>
@@ -182,6 +255,7 @@ def serve_ui():
 
         <script>
             let currentAbortController = null;
+            let eventSource = null;
 
             marked.setOptions({
                 highlight: function(code, lang) {
@@ -195,7 +269,6 @@ def serve_ui():
                 const tempDiv = document.createElement('div');
                 tempDiv.innerHTML = rawHtml;
                 
-                // Add copy buttons to code blocks
                 tempDiv.querySelectorAll('pre').forEach((pre) => {
                     const btn = document.createElement('button');
                     btn.className = 'copy-btn';
@@ -276,6 +349,9 @@ def serve_ui():
                 assistantDiv.className = 'msg assistant';
                 container.appendChild(assistantDiv);
 
+                // Show typing indicator
+                assistantDiv.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+
                 currentAbortController = new AbortController();
                 let fullText = "";
 
@@ -290,11 +366,20 @@ def serve_ui():
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder("utf-8");
 
+                    // Remove typing indicator on first chunk
+                    let firstChunk = true;
+
                     while (true) {
                         const { done, value } = await reader.read();
                         if (done) break;
                         const chunk = decoder.decode(value, { stream: true });
                         fullText += chunk;
+                        
+                        if (firstChunk) {
+                            assistantDiv.innerHTML = '';
+                            firstChunk = false;
+                        }
+                        
                         assistantDiv.innerHTML = renderMarkdown(fullText);
                         window.scrollTo(0, document.body.scrollHeight);
                     }
@@ -331,11 +416,11 @@ def serve_ui():
 
 @app.get("/config")
 async def read_behavior():
-    return {"current_instruction": get_system_instruction()}
+    return {"current_instruction": await get_system_instruction()}
 
 @app.post("/config")
 async def update_behavior(request: BehaviorRequest):
-    current_instruction = get_system_instruction()
+    current_instruction = await get_system_instruction()
     meta_prompt = (
         f"Current System Instructions:\n\"{current_instruction}\"\n\n"
         f"User request to change behavior:\n\"{request.instruction_change}\"\n\n"
@@ -343,73 +428,129 @@ async def update_behavior(request: BehaviorRequest):
         "core coding capabilities intact. Return ONLY the new system instruction text."
     )
     
-    for model_name in FREE_MODELS:
+    # Parallel execution for faster response
+    async def try_model(model_name):
         try:
             response = await client.chat.completions.create(
                 model=model_name,
-                messages=[{"role": "user", "content": meta_prompt}]
+                messages=[{"role": "user", "content": meta_prompt}],
+                timeout=15  # Shorter timeout for config updates
             )
-            new_instruction = response.choices[0].message.content.strip()
-            set_system_instruction(new_instruction)
-            return {"new_system_instruction": new_instruction}
+            return response.choices[0].message.content.strip()
         except Exception as e:
-            print(f"Config fallback from {model_name} due to error: {e}")
-            continue
-
+            print(f"Config model {model_name} failed: {e}")
+            return None
+    
+    # Try all models in parallel
+    tasks = [try_model(model) for model in FREE_MODELS]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for result in results:
+        if result and isinstance(result, str):
+            await set_system_instruction(result)
+            return {"new_system_instruction": result}
+    
     raise HTTPException(status_code=500, detail="All free models failed to update system configuration.")
 
 @app.get("/history")
 async def read_history(session_id: str = "default"):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT role, content FROM chat_history WHERE session_id = ? ORDER BY id ASC", (session_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return {"history": [{"role": r, "content": c} for r, c in rows]}
+    return {"history": await get_recent_chat_history(session_id)}
 
 @app.delete("/history")
 async def delete_history(session_id: str = "default"):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM chat_history WHERE session_id = ?", (session_id,))
-    conn.commit()
-    conn.close()
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("DELETE FROM chat_history WHERE session_id = ?", (session_id,))
+        await conn.commit()
     return {"status": "cleared"}
 
 @app.post("/ask")
 async def ask_code(request: QueryRequest):
-    current_instruction = get_system_instruction()
+    current_instruction = await get_system_instruction()
     
+    # Buffer the user message
     save_chat_message("user", request.prompt, session_id=request.session_id)
     
     messages = [{"role": "system", "content": current_instruction}]
-    messages.extend(get_recent_chat_history(session_id=request.session_id, limit=10))
+    messages.extend(await get_recent_chat_history(session_id=request.session_id, limit=10))
 
     async def generate_stream():
         full_reply = ""
         success = False
         
-        for model_name in FREE_MODELS:
+        # Try models in parallel for faster first response
+        async def try_model_stream(model_name):
+            nonlocal full_reply, success
             try:
                 stream = await client.chat.completions.create(
                     model=model_name,
                     messages=messages,
-                    stream=True
+                    stream=True,
+                    timeout=20
                 )
+                
                 async for chunk in stream:
                     if chunk.choices and chunk.choices[0].delta.content:
                         text_delta = chunk.choices[0].delta.content
                         full_reply += text_delta
                         yield text_delta
+                
                 success = True
-                break
+                return True
             except Exception as e:
-                print(f"Streaming model failure on {model_name}: {e}")
-                continue
-
+                print(f"Streaming model {model_name} failed: {e}")
+                return False
+        
+        # Create tasks for all models
+        tasks = []
+        for model_name in FREE_MODELS:
+            gen = try_model_stream(model_name)
+            tasks.append(asyncio.create_task(gen.__anext__()))
+        
+        # Use first successful response
+        try:
+            while tasks:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                
+                for task in done:
+                    try:
+                        result = task.result()
+                        if result:
+                            # This model succeeded, yield its content
+                            yield result
+                            # Cancel other tasks
+                            for t in pending:
+                                t.cancel()
+                            return
+                    except StopAsyncIteration:
+                        # Model finished successfully
+                        success = True
+                        return
+                    except Exception:
+                        # Model failed, continue with others
+                        pass
+                
+                tasks = list(pending)
+                
+                if not tasks:
+                    break
+                    
+        except Exception as e:
+            print(f"Streaming error: {e}")
+        
         if success:
+            # Buffer the assistant response
             save_chat_message("assistant", full_reply, session_id=request.session_id)
         else:
             yield "\n\n[Error: All fallback models are currently unresponsive. Please try again shortly.]"
 
     return StreamingResponse(generate_stream(), media_type="text/plain")
+
+# Background task to flush chat buffer on shutdown
+async def shutdown_event():
+    await save_chat_message_batch()
+
+app.add_event_handler("shutdown", shutdown_event)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1, loop="asyncio")
