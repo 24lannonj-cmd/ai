@@ -973,7 +973,7 @@ async def ask_code(request: QueryRequest):
                 return 
             except Exception as e:
                 print(f"Streaming model {model_name} failed: {e}")
-                return False
+                continue
         
         # Create tasks for all models
         tasks = []
