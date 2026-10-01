@@ -96,11 +96,11 @@ client = OpenAI(
     }
 )
 
-# OpenRouter fallback list (strictly capped at 3 items max)
+# Active free fallback array (strictly max 3 items to prevent 400 errors)
 FREE_MODELS = [
+    "qwen/qwen-2.5-coder-32b-instruct:free",
     "google/gemini-2.0-flash-exp:free",
-    "deepseek/deepseek-r1:free",
-    "qwen/qwen-2.5-coder-32b-instruct:free"
+    "deepseek/deepseek-r1:free"
 ]
 
 class QueryRequest(BaseModel):
