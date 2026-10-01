@@ -495,7 +495,7 @@ async def ask_code(request: QueryRequest):
                         yield text_delta
                 
                 success = True
-                return True
+                return 
             except Exception as e:
                 print(f"Streaming model {model_name} failed: {e}")
                 return False
