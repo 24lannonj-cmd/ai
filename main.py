@@ -98,7 +98,7 @@ client = OpenAI(
 
 # Active free fallback array (strictly max 3 items to prevent 400 errors)
 FREE_MODELS = [
-    "qwen/qwen-2.5-coder-32b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free",
     "google/gemini-2.0-flash-exp:free",
     "deepseek/deepseek-r1:free"
 ]
