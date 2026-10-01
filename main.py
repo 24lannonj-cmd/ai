@@ -1,14 +1,14 @@
 import os
 import sqlite3
+import json
 from typing import List
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from openai import OpenAI
 
 app = FastAPI(title="Adaptive AI Coding Assistant")
 
-# Use persistent directory for Render (/data) or fallback locally
 DATA_DIR = "/data" if os.path.exists("/data") else "."
 DB_FILE = os.path.join(DATA_DIR, "assistant.db")
 
@@ -72,10 +72,11 @@ def save_chat_message(role: str, content: str):
     conn.commit()
     conn.close()
 
-def get_chat_history() -> List[dict]:
+# Optimized to fetch only the recent context window (last 10 messages)
+def get_recent_chat_history(limit: int = 10) -> List[dict]:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT role, content FROM chat_history ORDER BY id ASC")
+    cursor.execute("SELECT role, content FROM (SELECT id, role, content FROM chat_history ORDER BY id DESC LIMIT ?) ORDER BY id ASC", (limit,))
     rows = cursor.fetchall()
     conn.close()
     return [{"role": role, "content": text} for role, text in rows]
@@ -86,7 +87,6 @@ api_key = os.getenv("OPENROUTER_API_KEY")
 if not api_key:
     raise RuntimeError("OPENROUTER_API_KEY environment variable is missing!")
 
-# OpenRouter client initialization with required headers
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=api_key,
@@ -96,12 +96,11 @@ client = OpenAI(
     }
 )
 
-# OpenRouter fallback list (openrouter/free dynamically routes to whatever $0/token model is available)
-# Capped at strictly 3 items to avoid 400 errors from OpenRouter
+# Prioritize fast flash models to minimize latency
 FREE_MODELS = [
+    "google/gemini-2.0-flash-exp:free",
     "openrouter/free",
-    "qwen/qwen3.8-27b:free",
-    "nvidia/nemotron-3-ultra-550b-a55b:free"
+    "qwen/qwen3.8-27b:free"
 ]
 
 class QueryRequest(BaseModel):
@@ -124,7 +123,7 @@ def serve_ui():
             .box { background: #1e293b; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; border: 1px solid #334155; }
             textarea { width: 100%; height: 70px; background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: 4px; padding: 0.5rem; box-sizing: border-box; }
             button { background: #0284c7; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 4px; cursor: pointer; margin-top: 0.5rem; font-weight: bold; }
-            .msg { padding: 0.8rem; margin: 0.5rem 0; border-radius: 6px; white-space: pre-wrap; }
+            .msg { padding: 0.8rem; margin: 0.5rem 0; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
             .user { background: #1e3a8a; }
             .assistant { background: #064e3b; }
             .error { color: #f87171; font-weight: bold; }
@@ -145,7 +144,7 @@ def serve_ui():
             <div id="chatHistory"></div>
             <hr style="border-color:#334155; margin: 1rem 0;">
             <textarea id="promptInput" placeholder="Ask a question or request code..."></textarea>
-            <button onclick="sendPrompt()">Send</button>
+            <button id="sendBtn" onclick="sendPrompt()">Send</button>
             <button onclick="clearChat()" style="background:#dc2626; float:right;">Clear History</button>
         </div>
 
@@ -188,19 +187,49 @@ def serve_ui():
             }
 
             async function sendPrompt() {
-                const prompt = document.getElementById('promptInput').value;
+                const input = document.getElementById('promptInput');
+                const prompt = input.value.trim();
                 if (!prompt) return;
-                document.getElementById('promptInput').value = '';
-                const res = await fetch('/ask', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt: prompt })
-                });
-                const data = await res.json();
-                if (!res.ok) {
-                    alert("Error: " + data.detail);
+
+                const sendBtn = document.getElementById('sendBtn');
+                sendBtn.disabled = true;
+                input.value = '';
+
+                const container = document.getElementById('chatHistory');
+
+                // Render user message immediately
+                const userDiv = document.createElement('div');
+                userDiv.className = 'msg user';
+                userDiv.innerText = 'You: ' + prompt;
+                container.appendChild(userDiv);
+
+                // Prepare placeholder for streaming assistant response
+                const assistantDiv = document.createElement('div');
+                assistantDiv.className = 'msg assistant';
+                assistantDiv.innerText = 'AI: ';
+                container.appendChild(assistantDiv);
+
+                try {
+                    const response = await fetch('/ask', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ prompt: prompt })
+                    });
+
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder("utf-8");
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        const chunk = decoder.decode(value, { stream: true });
+                        assistantDiv.innerText += chunk;
+                    }
+                } catch (err) {
+                    assistantDiv.innerText += " [Error streaming response]";
+                } finally {
+                    sendBtn.disabled = false;
                 }
-                fetchHistory();
             }
 
             async function clearChat() {
@@ -263,21 +292,32 @@ def delete_history():
 def ask_code(request: QueryRequest):
     current_instruction = get_system_instruction()
     
-    messages = [{"role": "system", "content": current_instruction}]
-    messages.extend(get_chat_history())
-    messages.append({"role": "user", "content": request.prompt})
+    # Save user query to DB before API call
+    save_chat_message("user", request.prompt)
     
-    try:
-        response = client.chat.completions.create(
-            model=FREE_MODELS[0],
-            messages=messages,
-            extra_body={"models": FREE_MODELS}
-        )
-        ai_reply = response.choices[0].message.content
-        
-        save_chat_message("user", request.prompt)
-        save_chat_message("assistant", ai_reply)
-        return {"response": ai_reply}
-    except Exception as e:
-        print(f"Ask Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Fetch only recent context to keep token count low and fast
+    messages = [{"role": "system", "content": current_instruction}]
+    messages.extend(get_recent_chat_history(limit=10))
+
+    def generate_stream():
+        full_reply = ""
+        try:
+            stream = client.chat.completions.create(
+                model=FREE_MODELS[0],
+                messages=messages,
+                extra_body={"models": FREE_MODELS},
+                stream=True
+            )
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    text_delta = chunk.choices[0].delta.content
+                    full_reply += text_delta
+                    yield text_delta
+            
+            # Save assistant reply after stream finishes
+            save_chat_message("assistant", full_reply)
+        except Exception as e:
+            print(f"Stream Error: {e}")
+            yield f"\n[Error: {str(e)}]"
+
+    return StreamingResponse(generate_stream(), media_type="text/plain")
